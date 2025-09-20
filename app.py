@@ -1,11 +1,18 @@
 import os
 import io
+import json
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+# For PDF export (static image export of Plotly figs)
+import plotly.io as pio
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import cm
 
 # ------------------ CONFIG ------------------
 DEFAULT_PATH = "C:/Users/User/OneDrive/Documents/Factory_Project.xlsx"
@@ -29,6 +36,8 @@ def load_custom_css():
     .section { background:linear-gradient(90deg, #f8f9fa, #eef2f7); border-left:4px solid #667eea;
       padding:.7rem 1rem; border-radius:10px; margin:1rem 0 .6rem 0; font-weight:600; }
     .panel { background:#fff; border-radius:12px; padding:1rem; box-shadow:0 4px 14px rgba(0,0,0,.06); }
+    .qa-box { border:1px solid #e5e7eb; border-left:4px solid #f59e0b; background:#fffbea; padding:12px; border-radius:8px; }
+    .qa-title { font-weight:700; margin-bottom:6px; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -134,33 +143,24 @@ def build_base_model(sheets, shift_hours=SHIFT_HOURS_DEFAULT):
 
     return df, sales_df
 
-# ------------------ CHARTS (existing) ------------------
+# ------------------ CHARTS (core) ------------------
 def charts_core(df, agg, sales_df, gap):
     charts = {}
-
-    # Capacity vs Actual per machine
+    # per machine bar
     fig1 = go.Figure()
-    fig1.add_trace(go.Bar(
-        name='Theoretical Capacity',
-        x=[f"M{i+1}" for i in range(len(df))],
-        y=df["Theoretical Production per Day (cups)"],
-        marker_color='rgba(102, 126, 234, 0.6)',
-        marker_line=dict(color='rgba(102, 126, 234, 1)', width=2)))
-    fig1.add_trace(go.Bar(
-        name='Actual Production',
-        x=[f"M{i+1}" for i in range(len(df))],
-        y=df["Actual Production per Day (cups)"],
-        marker_color='rgba(118, 75, 162, 0.8)',
-        marker_line=dict(color='rgba(118, 75, 162, 1)', width=2)))
-    fig1.update_layout(barmode='group', title="🏭 Production Capacity vs Actual Output",
-                       height=460, legend_orientation="h")
+    fig1.add_trace(go.Bar(name='Theoretical Capacity',
+                          x=[f"M{i+1}" for i in range(len(df))],
+                          y=df["Theoretical Production per Day (cups)"]))
+    fig1.add_trace(go.Bar(name='Actual Production',
+                          x=[f"M{i+1}" for i in range(len(df))],
+                          y=df["Actual Production per Day (cups)"]))
+    fig1.update_layout(barmode='group', title="🏭 Production Capacity vs Actual Output", height=460)
     charts['cap_vs_actual'] = fig1
 
-    # Utilization histogram
-    fig2 = px.histogram(df, x="Efficiency (Actual)", nbins=15, title="⚡ Utilization Distribution")
-    charts['util_hist'] = fig2
+    # utilization
+    charts['util_hist'] = px.histogram(df, x="Efficiency (Actual)", nbins=15, title="⚡ Utilization Distribution")
 
-    # Scenario aggregates
+    # scenarios
     fig3 = make_subplots(specs=[[{"secondary_y": True}]])
     scenarios = ["Current", "12h", "16h", "20h", "24h"]
     outputs = [agg["Current/month"], agg["12h/month"], agg["16h/month"], agg["20h/month"], agg["24h/month"]]
@@ -171,7 +171,6 @@ def charts_core(df, agg, sales_df, gap):
     fig3.update_layout(title="📈 Scenario Analysis: Output vs Margin", height=460, legend_orientation="h")
     charts['scenario'] = fig3
 
-    # Sales vs production (if sales)
     if gap["has_sales"]:
         srt = sales_df.sort_values("Month")
         fig4 = go.Figure()
@@ -184,90 +183,55 @@ def charts_core(df, agg, sales_df, gap):
 
 # ------------------ NEW MODULES ------------------
 def unit_economics_waterfall(df, price_adj=0.0, paper_adj=0.0, eff_adj=0.0, waste_adj=0.0):
-    """
-    Compute average per-1k unit economics across machines, allow simple what-ifs.
-    price_adj, paper_adj, eff_adj, waste_adj are percentage deltas (e.g., +5 -> +5%).
-    """
-    # Base per 1k
     price_1k = df["Selling Price per 1,000 cups (SAR)"].mean(skipna=True)
     raw_1k   = df["Raw Material Cost per 1,000 cups (SAR)"].mean(skipna=True)
-
-    # Conversion per 1k: shift-cost/day divided by (actual/day / 1000)
     actual_day_total = df["Actual Production per Day (cups)"].sum()
     shift_cost_day_total = df["Shift Cost/day (SAR)"].sum()
-    conv_per_1k = 0.0
-    if actual_day_total > 0:
-        conv_per_1k = shift_cost_day_total / (actual_day_total / 1000.0)
-
+    conv_per_1k = shift_cost_day_total / (actual_day_total / 1000.0) if actual_day_total>0 else 0.0
     waste_rate = df["Wastage / Rejection Rate (%)"].mean(skipna=True) / 100.0
 
-    # Apply what-ifs
     price_1k *= (1 + price_adj/100.0)
     raw_1k   *= (1 + paper_adj/100.0)
-    eff_mult = (1 + eff_adj/100.0)
-    # efficiency improvement lowers conversion per 1k proportionally (simple model)
-    conv_per_1k = conv_per_1k / eff_mult
+    conv_per_1k = conv_per_1k / (1 + eff_adj/100.0)
     waste_rate = max(0.0, waste_rate * (1 + waste_adj/100.0))
-
-    # Wastage cost (assume it mainly hits raw + conversion)
     waste_cost_1k = waste_rate * (raw_1k + conv_per_1k)
-
     gm_1k = price_1k - raw_1k - conv_per_1k - waste_cost_1k
 
-    steps = [
-        ("Price",           price_1k,  "relative"),
-        ("Raw Material",   -raw_1k,    "relative"),
-        ("Labor + Power",  -conv_per_1k, "relative"),
-        ("Wastage Cost",   -waste_cost_1k, "relative"),
-        ("Gross Margin",    gm_1k,     "total")
-    ]
-    fig = go.Figure(go.Waterfall(
-        measure=[s[2] for s in steps],
-        x=[s[0] for s in steps],
-        y=[s[1] for s in steps],
-        connector={"line":{"color":"#888"}}
-    ))
+    steps = [("Price",price_1k,"relative"),("Raw Material",-raw_1k,"relative"),
+             ("Labor + Power",-conv_per_1k,"relative"),("Wastage Cost",-waste_cost_1k,"relative"),
+             ("Gross Margin",gm_1k,"total")]
+    fig = go.Figure(go.Waterfall(measure=[s[2] for s in steps],
+                                 x=[s[0] for s in steps],
+                                 y=[s[1] for s in steps],
+                                 connector={"line":{"color":"#777"}}))
     fig.update_layout(title="💵 Unit Economics per 1,000 Cups (What-if)", height=420)
-
-    summary = dict(
-        price_1k=price_1k, raw_1k=raw_1k, conv_1k=conv_per_1k,
-        waste_rate=waste_rate, waste_cost_1k=waste_cost_1k, gm_1k=gm_1k
-    )
-    return fig, summary
+    return fig, dict(price_1k=price_1k, raw_1k=raw_1k, conv_1k=conv_per_1k,
+                     waste_rate=waste_rate, waste_cost_1k=waste_cost_1k, gm_1k=gm_1k)
 
 def compute_oee(df):
-    # Quality = 1 - wastage
     quality = 1 - (df["Wastage / Rejection Rate (%)"].fillna(0)/100.0)
-    # Availability = (hours - downtime)/hours
     avail = (df["Current Working Hours per Day"] - df["Avg Downtime per Day (hrs)"].fillna(0)) / df["Current Working Hours per Day"].replace(0, np.nan)
-    # Performance = actual/theoretical
     perf = df["Actual Production per Day (cups)"] / df["Theoretical Production per Day (cups)"].replace(0, np.nan)
-    oee = avail * perf * quality
     out = df.copy()
     out["Availability"] = avail
     out["Performance"]  = perf
     out["Quality"]      = quality
-    out["OEE"]          = oee
+    out["OEE"]          = avail * perf * quality
     return out
 
 def breakeven_and_sensitivity(df, fixed_overheads_sar, hours_grid=(np.arange(8,25,1)), eff_grid=(np.arange(0.6,0.96,0.02))):
-    # Use portfolio averages for per-1k economics
     price_1k = df["Selling Price per 1,000 cups (SAR)"].mean(skipna=True)
     raw_1k   = df["Raw Material Cost per 1,000 cups (SAR)"].mean(skipna=True)
-
     actual_day_total = df["Actual Production per Day (cups)"].sum()
     shift_cost_day_total = df["Shift Cost/day (SAR)"].sum()
     conv_per_1k = shift_cost_day_total / (actual_day_total/1000.0) if actual_day_total>0 else 0.0
-
     waste_rate = df["Wastage / Rejection Rate (%)"].mean(skipna=True)/100.0
     waste_cost_1k = waste_rate * (raw_1k + conv_per_1k)
-
-    var_cost_per_cup = (raw_1k + conv_per_1k + waste_cost_1k) / 1000.0
+    var_per_cup = (raw_1k + conv_per_1k + waste_cost_1k) / 1000.0
     price_per_cup = price_1k / 1000.0
-    unit_margin = price_per_cup - var_cost_per_cup
+    unit_margin = price_per_cup - var_per_cup
     breakeven_monthly_cups = fixed_overheads_sar / max(1e-6, unit_margin)
 
-    # Sensitivity: monthly GM for hours x eff grid
     rated_total_cpm = df["Rated Capacity (cups/min)"].sum()
     days = df["Working Days per Month"].mean(skipna=True)
     Z = np.zeros((len(eff_grid), len(hours_grid)))
@@ -275,7 +239,6 @@ def breakeven_and_sensitivity(df, fixed_overheads_sar, hours_grid=(np.arange(8,2
         for j, h in enumerate(hours_grid):
             theo_cups_month = rated_total_cpm * 60 * h * days
             actual_cups_month = theo_cups_month * e
-            # Scale shift-costs with hours vs current average hours
             cur_hours = df["Current Working Hours per Day"].mean(skipna=True)
             total_shift_cost_month = df["Shift Cost/day (SAR)"].sum() * days * (h / max(1e-6, cur_hours))
             gm_month = actual_cups_month * unit_margin - total_shift_cost_month - fixed_overheads_sar
@@ -284,47 +247,86 @@ def breakeven_and_sensitivity(df, fixed_overheads_sar, hours_grid=(np.arange(8,2
 
 def capacity_expansion(df, new_machines:int, capex_per_machine:float, hours:int, eff:float,
                        ramp_months:int=6, added_fixed_opex:float=0.0):
-    """
-    Simple 12-month expansion model using portfolio averages for new machines.
-    Returns DataFrame with month, incr_output, incr_gm, cum_cash, payback_month.
-    """
     if new_machines <= 0:
         months = np.arange(1, 13)
         base = pd.DataFrame({"Month": months, "Incremental Output (cups)": 0.0,
-                             "Incremental GM (SAR)": 0.0, "Cumulative Cash (SAR)": -capex_per_machine*0})
+                             "Incremental GM (SAR)": 0.0, "Cumulative Cash (SAR)": 0.0})
         return base, None
 
     avg_cpm = df["Rated Capacity (cups/min)"].mean(skipna=True)
     days = int(df["Working Days per Month"].mean(skipna=True))
     margin_per_1k = df["Margin per 1k (SAR)"].mean(skipna=True)
     cur_hours = df["Current Working Hours per Day"].mean(skipna=True)
-    # Avg shift cost/day per machine
     shift_cost_day_pm = df["Shift Cost/day (SAR)"].sum() / max(1, len(df))
 
     months = np.arange(1, 13)
-    outputs = []
-    gms = []
-    cash = []
-    cum = - new_machines * capex_per_machine  # invest upfront
+    outputs, gms, cash = [], [], []
+    cum = - new_machines * capex_per_machine
     for m in months:
-        # ramp from 40% to 100% over ramp_months
         ramp_factor = min(1.0, 0.4 + 0.6*(m/ramp_months)) if ramp_months>0 else 1.0
         theo_day = avg_cpm * 60 * hours * eff * ramp_factor
         out_month = theo_day * days * new_machines
-        # scale shift cost with hours/time vs current
         shift_cost = shift_cost_day_pm * (hours / max(1e-6, cur_hours)) * days * new_machines
         gm = (out_month/1000.0)*margin_per_1k - shift_cost - added_fixed_opex
         cum += gm
         outputs.append(out_month); gms.append(gm); cash.append(cum)
 
-    dfm = pd.DataFrame({
-        "Month": months,
-        "Incremental Output (cups)": outputs,
-        "Incremental GM (SAR)": gms,
-        "Cumulative Cash (SAR)": cash
-    })
+    dfm = pd.DataFrame({"Month": months,
+                        "Incremental Output (cups)": outputs,
+                        "Incremental GM (SAR)": gms,
+                        "Cumulative Cash (SAR)": cash})
     payback_month = int(dfm.index[dfm["Cumulative Cash (SAR)"]>=0].min()+1) if (dfm["Cumulative Cash (SAR)"]>=0).any() else None
     return dfm, payback_month
+
+# ------------------ GOVERNANCE / QA ------------------
+REQUIRED_COLS = [
+    "Machine Name/ID","Rated Capacity (cups/min)","Current Working Hours per Day",
+    "Working Days per Month","Actual Production per Day (cups)","Theoretical Production per Day (cups)",
+    "Raw Material Cost per 1,000 cups (SAR)","Selling Price per 1,000 cups (SAR)",
+    "Avg Downtime per Day (hrs)","Wastage / Rejection Rate (%)"
+]
+
+def data_quality_checks(df):
+    issues = []
+
+    # Missing columns
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        issues.append(("ERROR", f"Missing required columns: {', '.join(missing)}"))
+
+    # Negative checks
+    for col in ["Rated Capacity (cups/min)","Current Working Hours per Day","Working Days per Month",
+                "Actual Production per Day (cups)","Theoretical Production per Day (cups)",
+                "Raw Material Cost per 1,000 cups (SAR)","Selling Price per 1,000 cups (SAR)",
+                "Avg Downtime per Day (hrs)"]:
+        if col in df.columns and (df[col].dropna() < 0).any():
+            issues.append(("ERROR", f"Negative values found in {col}"))
+
+    # Utilization > 110%
+    if "Efficiency (Actual)" in df.columns:
+        if (df["Efficiency (Actual)"] > 1.10).any():
+            n = int((df["Efficiency (Actual)"] > 1.10).sum())
+            issues.append(("WARN", f"Efficiency exceeds 110% for {n} machines (check actual/theoretical)."))
+
+    # Downtime > hours
+    if "Avg Downtime per Day (hrs)" in df.columns and "Current Working Hours per Day" in df.columns:
+        mask = df["Avg Downtime per Day (hrs)"] > df["Current Working Hours per Day"]
+        if mask.any():
+            issues.append(("ERROR", f"Downtime greater than working hours for {int(mask.sum())} machines."))
+
+    # Wastage outside 0–100%
+    if "Wastage / Rejection Rate (%)" in df.columns:
+        w = df["Wastage / Rejection Rate (%)"].dropna()
+        if (w < 0).any() or (w > 100).any():
+            issues.append(("ERROR", "Wastage % outside 0–100 range."))
+
+    # Zero working days
+    if "Working Days per Month" in df.columns and (df["Working Days per Month"].fillna(0) <= 0).any():
+        issues.append(("WARN", "Some machines have 0 working days/month."))
+
+    if not issues:
+        issues.append(("INFO","No critical data quality issues detected."))
+    return issues
 
 # ------------------ MAIN APP ------------------
 def main():
@@ -362,10 +364,23 @@ def main():
         st.error(f"Could not read Excel. Upload a file or check path.\n\nDetails: {e}")
         st.stop()
 
+    # Governance banner (always visible)
+    qa_issues = data_quality_checks(df)
+    if qa_issues:
+        sev = qa_issues[0][0]
+        box = st.warning if sev in ("WARN","INFO") else st.error
+        msg = "<div class='qa-box'><div class='qa-title'>Governance / Data QA</div><ul>"
+        for level, text in qa_issues[:6]:
+            badge = {"ERROR":"❌","WARN":"⚠️","INFO":"ℹ️"}[level]
+            msg += f"<li>{badge} {text}</li>"
+        msg += "</ul></div>"
+        box(msg, icon=None)
+
+    # Aggregates
     agg = portfolio_agg(df, scenarios_eff)
     gap = sales_gap(df, sales_df)
 
-    # ==== Projection for KPIs ====
+    # Projection for KPIs
     if use_hours_override:
         nearest = min(SCENARIO_EFF_DEFAULT.keys(), key=lambda h: abs(h - oper_hours))
         eff = scenarios_eff.get(nearest, SCENARIO_EFF_DEFAULT[nearest])
@@ -374,15 +389,13 @@ def main():
         kpi_month = float(proj_month.sum())
         kpi_idle = float((df["Rated Capacity (cups/min)"]*60*oper_hours - proj_day).clip(lower=0).sum())
         kpi_gm = float(proj_gm.sum())
-        hours_label = f"{oper_hours}h (projected)"
     else:
         kpi_day = float(df["Actual Production per Day (cups)"].sum())
         kpi_month = float(agg["Current/month"])
         kpi_idle = float((df["Theoretical Production per Day (cups)"] - df["Actual Production per Day (cups)"]).clip(lower=0).sum())
         kpi_gm = float(agg["Current GM/month (SAR)"])
-        hours_label = f"{shift_hours}h (shift length)"
 
-    # ==== Executive KPIs ====
+    # KPIs
     st.markdown("<div class='section'>📊 Executive Dashboard</div>", unsafe_allow_html=True)
     c1,c2,c3,c4 = st.columns(4)
     with c1: kpi_card("Total Machines", len(df), " units")
@@ -395,7 +408,7 @@ def main():
     with c7: kpi_card("Idle Capacity", kpi_idle, " cups/day")
     with c8: kpi_card("Hours Setting", float(oper_hours if use_hours_override else shift_hours), "h")
 
-    # ==== Core charts ====
+    # Core charts
     st.markdown("<div class='section'>📈 Performance Analytics</div>", unsafe_allow_html=True)
     charts = charts_core(df, agg, sales_df, gap)
     a,b = st.columns(2)
@@ -405,11 +418,10 @@ def main():
     if gap["has_sales"]:
         st.plotly_chart(charts['sales_vs_prod'], use_container_width=True)
 
-    # ==== Investor Modules ====
+    # Investor Modules
     st.markdown("<div class='section'>🧭 Investor Modules</div>", unsafe_allow_html=True)
     tab1, tab2, tab3, tab4 = st.tabs(["Unit Economics", "OEE & Bottlenecks", "Breakeven & Sensitivity", "Capacity Expansion"])
 
-    # ----- Tab 1: Unit Economics -----
     with tab1:
         st.markdown("#### 💵 Unit Economics (per 1,000 cups) — Waterfall & What-if")
         colu = st.columns(4)
@@ -417,11 +429,10 @@ def main():
         paper_adj = colu[1].number_input("Paper Cost Δ (%)", -50.0, 50.0, 0.0, 1.0)
         eff_adj   = colu[2].number_input("Efficiency Δ (%)", -30.0, 30.0, 0.0, 1.0)
         waste_adj = colu[3].number_input("Wastage Δ (%)", -50.0, 50.0, 0.0, 1.0)
-        fig_wf, u = unit_economics_waterfall(df, price_adj, paper_adj, eff_adj, waste_adj)
+        fig_wf, ueco = unit_economics_waterfall(df, price_adj, paper_adj, eff_adj, waste_adj)
         st.plotly_chart(fig_wf, use_container_width=True)
-        st.caption(f"Price: {u['price_1k']:,.0f} | Raw: {u['raw_1k']:,.0f} | Conv: {u['conv_1k']:,.0f} | Wastage: {u['waste_cost_1k']:,.0f} | **GM/1k: {u['gm_1k']:,.0f} SAR**")
+        st.caption(f"Price: {ueco['price_1k']:,.0f} | Raw: {ueco['raw_1k']:,.0f} | Conv: {ueco['conv_1k']:,.0f} | Wastage: {ueco['waste_cost_1k']:,.0f} | **GM/1k: {ueco['gm_1k']:,.0f} SAR**")
 
-    # ----- Tab 2: OEE & Bottlenecks -----
     with tab2:
         st.markdown("#### 🛠️ OEE (Availability × Performance × Quality)")
         oee_df = compute_oee(df)
@@ -441,7 +452,6 @@ def main():
         else:
             st.info("No 'Downtime Reasons' column found.")
 
-    # ----- Tab 3: Breakeven & Sensitivity -----
     with tab3:
         st.markdown("#### ⚖️ Breakeven & Profit Sensitivity")
         fixed_ov = st.number_input("Fixed Overheads / month (SAR)", 0.0, 1e9, 0.0, 1000.0)
@@ -453,30 +463,28 @@ def main():
                          title="Monthly Gross Margin Sensitivity (Hours × Efficiency)")
         st.plotly_chart(heat, use_container_width=True)
 
-    # ----- Tab 4: Capacity Expansion & Payback -----
     with tab4:
         st.markdown("#### 🚀 Expansion Model (12-month) & Payback")
         ce1, ce2, ce3 = st.columns(3)
         new_m = ce1.number_input("New Machines", 0, 200, 2, 1)
         capex = ce2.number_input("Capex per Machine (SAR)", 0.0, 1e9, 150000.0, 1000.0)
         ramp  = ce3.number_input("Ramp-up Months (to 100%)", 0, 24, 6, 1)
-
         ce4, ce5, ce6 = st.columns(3)
         hours_new = ce4.slider("Operating Hours / day (new)", 8, 24, 16, 1)
         eff_new   = ce5.slider("Efficiency (new)", 0.60, 0.95, 0.78, 0.01)
         add_opex  = ce6.number_input("Added Fixed Opex / month (SAR)", 0.0, 1e8, 0.0, 1000.0)
 
         dfm, payback = capacity_expansion(df, new_m, capex, hours_new, eff_new, ramp, add_opex)
-        st.plotly_chart(px.bar(dfm, x="Month", y="Incremental GM (SAR)", title="Incremental Gross Margin (Monthly)"),
-                        use_container_width=True)
-        st.plotly_chart(px.line(dfm, x="Month", y="Cumulative Cash (SAR)", markers=True,
-                                title="Cumulative Cash vs Time (after Capex)"), use_container_width=True)
+        exp_bar = px.bar(dfm, x="Month", y="Incremental GM (SAR)", title="Incremental Gross Margin (Monthly)")
+        exp_line = px.line(dfm, x="Month", y="Cumulative Cash (SAR)", markers=True, title="Cumulative Cash vs Time (after Capex)")
+        st.plotly_chart(exp_bar, use_container_width=True)
+        st.plotly_chart(exp_line, use_container_width=True)
         if payback is None:
             st.warning("Payback not reached within 12 months.")
         else:
             st.success(f"Estimated **Payback**: Month {payback}")
 
-    # ==== Detailed machine table ====
+    # Detailed machine table
     st.markdown("<div class='section'>📋 Detailed Machine Analysis</div>", unsafe_allow_html=True)
     show_cols = [
         "Machine Name/ID","Machine Type","Condition","Cup Thickness (mm)",
@@ -488,9 +496,9 @@ def main():
         "Avg Downtime per Day (hrs)","Wastage / Rejection Rate (%)","Downtime Reasons"
     ]
     table_df = df[show_cols].copy().sort_values("Gross Margin/month (SAR)", ascending=False)
-    # Ensure numeric for styling
-    num_cols = [c for c in table_df.columns if c not in ["Machine Name/ID","Machine Type","Condition","Downtime Reasons"]]
-    for c in num_cols: table_df[c] = pd.to_numeric(table_df[c], errors="coerce")
+    for c in table_df.columns:
+        if c not in ["Machine Name/ID","Machine Type","Condition","Downtime Reasons"]:
+            table_df[c] = pd.to_numeric(table_df[c], errors="coerce")
     st.dataframe(
         table_df.style
         .format({
@@ -510,6 +518,161 @@ def main():
         .background_gradient(subset=["Gross Margin/month (SAR)"], cmap="RdYlGn"),
         use_container_width=True, height=420
     )
+
+    # =========================
+    #  EXPORT & GOVERNANCE
+    # =========================
+    st.markdown("<div class='section'>📥 Export & Governance</div>", unsafe_allow_html=True)
+
+    # ---- Build artifacts for export ----
+    # Scenario aggregate table
+    scen_df = pd.DataFrame([
+        {"Scenario":"Current","Monthly Output (cups)":agg["Current/month"],"GM/month (SAR)":agg["Current GM/month (SAR)"]},
+        {"Scenario":"12h","Monthly Output (cups)":agg["12h/month"],"GM/month (SAR)":agg["12h GM/month (SAR)"]},
+        {"Scenario":"16h","Monthly Output (cups)":agg["16h/month"],"GM/month (SAR)":agg["16h GM/month (SAR)"]},
+        {"Scenario":"20h","Monthly Output (cups)":agg["20h/month"],"GM/month (SAR)":agg["20h GM/month (SAR)"]},
+        {"Scenario":"24h","Monthly Output (cups)":agg["24h/month"],"GM/month (SAR)":agg["24h GM/month (SAR)"]},
+    ])
+
+    # Unit economics (base, no what-if)
+    _, ue_base = unit_economics_waterfall(df, 0, 0, 0, 0)
+
+    # OEE table
+    oee_df = compute_oee(df)[["Machine Name/ID","Availability","Performance","Quality","OEE"]].copy()
+
+    # Sensitivity grid (use last chosen fixed overhead if tab visited, else 0)
+    fixed_ov = locals().get("fixed_ov", 0.0)
+    be_cups, H, E, Z = breakeven_and_sensitivity(df, fixed_ov)
+
+    # Capacity expansion sample (reuse last settings if tab visited, else baseline)
+    new_m = locals().get("new_m", 0)
+    capex = locals().get("capex", 0.0)
+    hours_new = locals().get("hours_new", 16)
+    eff_new = locals().get("eff_new", 0.78)
+    ramp = locals().get("ramp", 6)
+    add_opex = locals().get("add_opex", 0.0)
+    dfm, payback = capacity_expansion(df, new_m, capex, hours_new, eff_new, ramp, add_opex)
+
+    # ---- Excel export ----
+    def build_excel():
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+            table_df.to_excel(writer, sheet_name="Machine Summary", index=False)
+            scen_df.to_excel(writer, sheet_name="Scenario Aggregate", index=False)
+            pd.DataFrame([ue_base]).to_excel(writer, sheet_name="Unit Economics (1k)", index=False)
+            oee_df.to_excel(writer, sheet_name="OEE by Machine", index=False)
+            # sensitivity grid
+            sens_df = pd.DataFrame(Z, index=[f"{e:.0%}" for e in E], columns=[int(h) for h in H])
+            sens_df.index.name = "Efficiency"
+            sens_df.to_excel(writer, sheet_name="Sensitivity GM (Hours x Eff)")
+            dfm.to_excel(writer, sheet_name="Expansion (12m)", index=False)
+            # QA issues
+            qa_sheet = pd.DataFrame([{"Level":lvl,"Issue":txt} for (lvl,txt) in qa_issues])
+            qa_sheet.to_excel(writer, sheet_name="Governance / QA", index=False)
+        buf.seek(0)
+        return buf
+
+    # ---- PDF export ----
+    def save_fig_png(fig) -> bytes:
+        # Export Plotly figure to PNG bytes via kaleido
+        return pio.to_image(fig, format="png", scale=2)
+
+    def build_pdf():
+        pdf_buf = io.BytesIO()
+        c = canvas.Canvas(pdf_buf, pagesize=A4)
+        width, height = A4
+
+        # Title
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(2*cm, height-2.5*cm, "Factory Investor Report")
+        c.setFont("Helvetica", 10)
+        c.drawString(2*cm, height-3.2*cm, f"Machines: {len(df)}  |  Utilization: {df['Efficiency (Actual)'].mean():.1%}  |  GM/Month: {kpi_gm:,.0f} SAR")
+
+        # Insert three charts (scenario, util hist, expansion cash)
+        figs = [charts['scenario'],
+                charts['util_hist'],
+                px.line(dfm, x="Month", y="Cumulative Cash (SAR)", markers=True, title="Cumulative Cash (Expansion)")]
+        y = height-4.2*cm
+        for fig in figs:
+            try:
+                img = save_fig_png(fig)
+                img_buf = io.BytesIO(img)
+                # Fit image to page width (keep aspect)
+                img_w = width-3*cm
+                img_h = 7.0*cm
+                c.drawImage(img_buf, 1.5*cm, y-img_h, img_w, img_h, preserveAspectRatio=True, mask='auto')
+                y -= (img_h + 1.0*cm)
+                if y < 4*cm:
+                    c.showPage()
+                    y = height-2*cm
+            except Exception:
+                # If image export fails, skip
+                pass
+
+        # Governance section
+        c.showPage()
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(2*cm, height-2.5*cm, "Governance / Data QA")
+        c.setFont("Helvetica", 10)
+        y = height-3.2*cm
+        for lvl, txt in qa_issues[:20]:
+            pref = {"ERROR":"[ERROR] ","WARN":"[WARN] ","INFO":"[INFO] "}[lvl]
+            for line in (pref+txt).split("\n"):
+                c.drawString(2*cm, y, line[:110])
+                y -= 0.6*cm
+                if y < 2*cm:
+                    c.showPage()
+                    y = height-2*cm
+
+        c.save()
+        pdf_buf.seek(0)
+        return pdf_buf
+
+    # ---- Assumptions JSON ----
+    assumptions = {
+        "shift_hours": shift_hours,
+        "use_hours_override": use_hours_override,
+        "oper_hours": int(oper_hours),
+        "scenario_efficiency": {k: float(v) for k, v in scenarios_eff.items()},
+        "fixed_overheads": float(locals().get("fixed_ov", 0.0)),
+        "expansion": {
+            "new_machines": int(new_m),
+            "capex_per_machine": float(capex),
+            "hours": int(hours_new),
+            "efficiency": float(eff_new),
+            "ramp_months": int(ramp),
+            "added_fixed_opex": float(add_opex)
+        }
+    }
+    assumptions_bytes = io.BytesIO(json.dumps(assumptions, indent=2).encode("utf-8"))
+
+    # ---- Download buttons ----
+    colX, colY, colZ = st.columns(3)
+    with colX:
+        st.download_button(
+            "📊 Download Excel Report",
+            data=build_excel(),
+            file_name="Factory_Investor_Report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary"
+        )
+    with colY:
+        try:
+            st.download_button(
+                "📄 Download PDF Investor Memo",
+                data=build_pdf(),
+                file_name="Factory_Investor_Memo.pdf",
+                mime="application/pdf"
+            )
+        except Exception as e:
+            st.info("Install `kaleido` and `reportlab` on Streamlit Cloud for PDF export.")
+    with colZ:
+        st.download_button(
+            "🧩 Download Assumptions (JSON)",
+            data=assumptions_bytes,
+            file_name="assumptions.json",
+            mime="application/json"
+        )
 
 if __name__ == "__main__":
     main()
