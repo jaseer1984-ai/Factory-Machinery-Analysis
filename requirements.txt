@@ -1,6 +1,4 @@
-streamlit==1.37.1
-pandas>=2.0
-numpy>=1.25
-plotly>=5.22
-openpyxl>=3.1
 xlsxwriter>=3.2
+openpyxl>=3.1
+reportlab>=3.6
+kaleido>=0.2
