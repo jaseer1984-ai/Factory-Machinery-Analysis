@@ -288,45 +288,45 @@ REQUIRED_COLS = [
 
 def data_quality_checks(df):
     issues = []
-
-    # Missing columns
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
         issues.append(("ERROR", f"Missing required columns: {', '.join(missing)}"))
-
-    # Negative checks
     for col in ["Rated Capacity (cups/min)","Current Working Hours per Day","Working Days per Month",
                 "Actual Production per Day (cups)","Theoretical Production per Day (cups)",
                 "Raw Material Cost per 1,000 cups (SAR)","Selling Price per 1,000 cups (SAR)",
                 "Avg Downtime per Day (hrs)"]:
         if col in df.columns and (df[col].dropna() < 0).any():
             issues.append(("ERROR", f"Negative values found in {col}"))
-
-    # Utilization > 110%
-    if "Efficiency (Actual)" in df.columns:
-        if (df["Efficiency (Actual)"] > 1.10).any():
-            n = int((df["Efficiency (Actual)"] > 1.10).sum())
-            issues.append(("WARN", f"Efficiency exceeds 110% for {n} machines (check actual/theoretical)."))
-
-    # Downtime > hours
+    if "Efficiency (Actual)" in df.columns and (df["Efficiency (Actual)"] > 1.10).any():
+        n = int((df["Efficiency (Actual)"] > 1.10).sum())
+        issues.append(("WARN", f"Efficiency exceeds 110% for {n} machines (check actual/theoretical)."))
     if "Avg Downtime per Day (hrs)" in df.columns and "Current Working Hours per Day" in df.columns:
         mask = df["Avg Downtime per Day (hrs)"] > df["Current Working Hours per Day"]
         if mask.any():
             issues.append(("ERROR", f"Downtime greater than working hours for {int(mask.sum())} machines."))
-
-    # Wastage outside 0–100%
     if "Wastage / Rejection Rate (%)" in df.columns:
         w = df["Wastage / Rejection Rate (%)"].dropna()
         if (w < 0).any() or (w > 100).any():
             issues.append(("ERROR", "Wastage % outside 0–100 range."))
-
-    # Zero working days
     if "Working Days per Month" in df.columns and (df["Working Days per Month"].fillna(0) <= 0).any():
         issues.append(("WARN", "Some machines have 0 working days/month."))
-
     if not issues:
         issues.append(("INFO","No critical data quality issues detected."))
     return issues
+
+# ---------- Sheet name sanitizer ----------
+INVALID_SHEET_CHARS = set(r'[]:*?/\\')
+def safe_sheet_name(name: str, used: set) -> str:
+    cleaned = "".join(ch for ch in name if ch not in INVALID_SHEET_CHARS)
+    cleaned = cleaned.strip()[:31] or "Sheet"
+    base = cleaned
+    i = 1
+    while cleaned in used:
+        suffix = f"_{i}"
+        cleaned = (base[:31-len(suffix)] + suffix)
+        i += 1
+    used.add(cleaned)
+    return cleaned
 
 # ------------------ MAIN APP ------------------
 def main():
@@ -387,7 +387,7 @@ def main():
         proj_day, proj_month, proj_gm = project_hours(df, oper_hours, eff)
         kpi_day = float(proj_day.sum())
         kpi_month = float(proj_month.sum())
-        kpi_idle = float((df["Rated Capacity (cups/min)"]*60*oper_hours - proj_day).clip(lower=0).sum())
+        kpi_idle = float((df["Rated Capacity (cups/min)"].sum()*60*oper_hours - proj_day.sum()))
         kpi_gm = float(proj_gm.sum())
     else:
         kpi_day = float(df["Actual Production per Day (cups)"].sum())
@@ -524,7 +524,6 @@ def main():
     # =========================
     st.markdown("<div class='section'>📥 Export & Governance</div>", unsafe_allow_html=True)
 
-    # ---- Build artifacts for export ----
     # Scenario aggregate table
     scen_df = pd.DataFrame([
         {"Scenario":"Current","Monthly Output (cups)":agg["Current/month"],"GM/month (SAR)":agg["Current GM/month (SAR)"]},
@@ -538,43 +537,44 @@ def main():
     _, ue_base = unit_economics_waterfall(df, 0, 0, 0, 0)
 
     # OEE table
-    oee_df = compute_oee(df)[["Machine Name/ID","Availability","Performance","Quality","OEE"]].copy()
+    oee_tab = compute_oee(df)[["Machine Name/ID","Availability","Performance","Quality","OEE"]].copy()
 
-    # Sensitivity grid (use last chosen fixed overhead if tab visited, else 0)
-    fixed_ov = locals().get("fixed_ov", 0.0)
-    be_cups, H, E, Z = breakeven_and_sensitivity(df, fixed_ov)
+    # Sensitivity grid using last fixed_ov value (0 if not set)
+    fixed_ov_val = locals().get("fixed_ov", 0.0)
+    be_cups, H, E, Z = breakeven_and_sensitivity(df, fixed_ov_val)
+    sens_df = pd.DataFrame(Z, index=[f"{e:.0%}" for e in E], columns=[int(h) for h in H]).rename_axis("Efficiency")
 
-    # Capacity expansion sample (reuse last settings if tab visited, else baseline)
-    new_m = locals().get("new_m", 0)
-    capex = locals().get("capex", 0.0)
-    hours_new = locals().get("hours_new", 16)
-    eff_new = locals().get("eff_new", 0.78)
-    ramp = locals().get("ramp", 6)
-    add_opex = locals().get("add_opex", 0.0)
-    dfm, payback = capacity_expansion(df, new_m, capex, hours_new, eff_new, ramp, add_opex)
+    # Capacity expansion table (reuse last chosen values if tab visited)
+    new_m_val = locals().get("new_m", 0)
+    capex_val = locals().get("capex", 0.0)
+    hours_new_val = locals().get("hours_new", 16)
+    eff_new_val = locals().get("eff_new", 0.78)
+    ramp_val = locals().get("ramp", 6)
+    add_opex_val = locals().get("add_opex", 0.0)
+    dfm, payback_val = capacity_expansion(df, new_m_val, capex_val, hours_new_val, eff_new_val, ramp_val, add_opex_val)
 
     # ---- Excel export ----
     def build_excel():
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-            table_df.to_excel(writer, sheet_name="Machine Summary", index=False)
-            scen_df.to_excel(writer, sheet_name="Scenario Aggregate", index=False)
-            pd.DataFrame([ue_base]).to_excel(writer, sheet_name="Unit Economics (1k)", index=False)
-            oee_df.to_excel(writer, sheet_name="OEE by Machine", index=False)
-            # sensitivity grid
-            sens_df = pd.DataFrame(Z, index=[f"{e:.0%}" for e in E], columns=[int(h) for h in H])
-            sens_df.index.name = "Efficiency"
-            sens_df.to_excel(writer, sheet_name="Sensitivity GM (Hours x Eff)")
-            dfm.to_excel(writer, sheet_name="Expansion (12m)", index=False)
-            # QA issues
-            qa_sheet = pd.DataFrame([{"Level":lvl,"Issue":txt} for (lvl,txt) in qa_issues])
-            qa_sheet.to_excel(writer, sheet_name="Governance / QA", index=False)
+            used = set()
+            sheets_to_write = [
+                ("Machine Summary", table_df),
+                ("Scenario Aggregate", scen_df),
+                ("Unit Economics (1k)", pd.DataFrame([ue_base])),
+                ("OEE by Machine", oee_tab),
+                ("Sensitivity GM (Hours x Eff)", sens_df),
+                ("Expansion (12m)", dfm),
+                ("Governance & QA", pd.DataFrame([{"Level":lvl,"Issue":txt} for (lvl,txt) in qa_issues])),
+            ]
+            for raw, df_out in sheets_to_write:
+                name = safe_sheet_name(raw, used)
+                df_out.to_excel(writer, sheet_name=name, index=False)
         buf.seek(0)
         return buf
 
     # ---- PDF export ----
     def save_fig_png(fig) -> bytes:
-        # Export Plotly figure to PNG bytes via kaleido
         return pio.to_image(fig, format="png", scale=2)
 
     def build_pdf():
@@ -582,13 +582,11 @@ def main():
         c = canvas.Canvas(pdf_buf, pagesize=A4)
         width, height = A4
 
-        # Title
         c.setFont("Helvetica-Bold", 16)
         c.drawString(2*cm, height-2.5*cm, "Factory Investor Report")
         c.setFont("Helvetica", 10)
         c.drawString(2*cm, height-3.2*cm, f"Machines: {len(df)}  |  Utilization: {df['Efficiency (Actual)'].mean():.1%}  |  GM/Month: {kpi_gm:,.0f} SAR")
 
-        # Insert three charts (scenario, util hist, expansion cash)
         figs = [charts['scenario'],
                 charts['util_hist'],
                 px.line(dfm, x="Month", y="Cumulative Cash (SAR)", markers=True, title="Cumulative Cash (Expansion)")]
@@ -597,7 +595,6 @@ def main():
             try:
                 img = save_fig_png(fig)
                 img_buf = io.BytesIO(img)
-                # Fit image to page width (keep aspect)
                 img_w = width-3*cm
                 img_h = 7.0*cm
                 c.drawImage(img_buf, 1.5*cm, y-img_h, img_w, img_h, preserveAspectRatio=True, mask='auto')
@@ -606,10 +603,8 @@ def main():
                     c.showPage()
                     y = height-2*cm
             except Exception:
-                # If image export fails, skip
                 pass
 
-        # Governance section
         c.showPage()
         c.setFont("Helvetica-Bold", 14)
         c.drawString(2*cm, height-2.5*cm, "Governance / Data QA")
@@ -634,14 +629,14 @@ def main():
         "use_hours_override": use_hours_override,
         "oper_hours": int(oper_hours),
         "scenario_efficiency": {k: float(v) for k, v in scenarios_eff.items()},
-        "fixed_overheads": float(locals().get("fixed_ov", 0.0)),
+        "fixed_overheads": float(fixed_ov_val),
         "expansion": {
-            "new_machines": int(new_m),
-            "capex_per_machine": float(capex),
-            "hours": int(hours_new),
-            "efficiency": float(eff_new),
-            "ramp_months": int(ramp),
-            "added_fixed_opex": float(add_opex)
+            "new_machines": int(new_m_val),
+            "capex_per_machine": float(capex_val),
+            "hours": int(hours_new_val),
+            "efficiency": float(eff_new_val),
+            "ramp_months": int(ramp_val),
+            "added_fixed_opex": float(add_opex_val)
         }
     }
     assumptions_bytes = io.BytesIO(json.dumps(assumptions, indent=2).encode("utf-8"))
@@ -664,7 +659,7 @@ def main():
                 file_name="Factory_Investor_Memo.pdf",
                 mime="application/pdf"
             )
-        except Exception as e:
+        except Exception:
             st.info("Install `kaleido` and `reportlab` on Streamlit Cloud for PDF export.")
     with colZ:
         st.download_button(
