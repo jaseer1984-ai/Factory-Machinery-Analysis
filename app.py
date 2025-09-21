@@ -1,4 +1,11 @@
-# app.py — Paper Cup Factory Dashboard (fixed KeyError, robust age detection, comma formatting)
+# app.py — Paper Cup Factory Dashboard
+# Features:
+# - Upload Excel; auto-detect Machines/Production sheets
+# - 12/16/20/24h forecast (baseline 12h, 28 days/month by default)
+# - 10-year annual forecast (units; optional revenue/GM)
+# - 10-year CAPEX replacement plan (10y life, same-year replacement)
+# - Robust age detection (Age / Start Date / Year)
+# - Comma-formatted tables; numeric data kept for charts & downloads
 
 from datetime import datetime
 import io
@@ -17,7 +24,7 @@ with st.sidebar:
 
     days_per_month = st.number_input("Days per month", 1, 31, value=28)
     hour_scenarios = st.multiselect(
-        "Hours per day (select)", options=[12,16,20,24], default=[12,16,20,24]
+        "Hours per day (select)", options=[12, 16, 20, 24], default=[12, 16, 20, 24]
     )
     machine_life_years = st.number_input("Machine life (years)", 1, 40, value=10)
     forecast_years = st.number_input("Forecast horizon (years)", 1, 30, value=10)
@@ -31,15 +38,14 @@ with st.sidebar:
 # ------------- Helpers -------------
 
 def find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    """
-    Return the ACTUAL column name from df that matches any name in candidates (case/space tolerant).
-    """
+    """Return the ACTUAL column name that matches any candidate (case/space tolerant)."""
     norm = {str(c).strip().lower(): c for c in df.columns}
+    # exact
     for want in candidates:
         key = str(want).strip().lower()
         if key in norm:
             return norm[key]
-    # also try looser contains-match
+    # contains
     for want in candidates:
         key = str(want).strip().lower()
         for k, real in norm.items():
@@ -62,8 +68,7 @@ def parse_date_series(s: pd.Series):
             return pd.to_datetime(v, errors="coerce", dayfirst=True)
         except:
             return pd.NaT
-    out = s.apply(parse_one)
-    return pd.to_datetime(out, errors="coerce")
+    return pd.to_datetime(s.apply(parse_one), errors="coerce")
 
 @st.cache_data(show_spinner=False)
 def load_workbook(file_bytes: bytes) -> dict:
@@ -90,7 +95,7 @@ def extract_core(machines_df: pd.DataFrame, prod_df: pd.DataFrame, life_years: f
         machines_df["Machine"] = [f"M{i+1}" for i in range(len(machines_df))]
         machine_col = "Machine"
 
-    # Capacity
+    # Capacity (cups/min)
     cap_col = find_col(machines_df, [
         "capacity","rated capacity","rated_capacity","cups/min","cups per min",
         "capacity (cups/min)","capacity_cups_min","capacity_cup_min"
@@ -141,8 +146,8 @@ def extract_core(machines_df: pd.DataFrame, prod_df: pd.DataFrame, life_years: f
         age_days = (today - machines_df["Start_Date"]).dt.days
         machines_df["Age_years"] = (age_days/365.25)
     elif year_col and year_col in machines_df.columns:
-        yr = pd.to_numeric(machines_df[year_col], errors="coerce").round().astype("Int64")
-        machines_df["Start_Date"] = pd.to_datetime(yr.astype("float").astype("Int64").astype(str) + "-01-01", errors="coerce")
+        yr = pd.to_numeric(machines_df[year_col], errors="coerce")
+        machines_df["Start_Date"] = pd.to_datetime(yr.round().astype("Int64").astype(str) + "-01-01", errors="coerce")
         age_days = (today - machines_df["Start_Date"]).dt.days
         machines_df["Age_years"] = (age_days/365.25)
     else:
@@ -208,6 +213,15 @@ def to_excel_bytes(sheets: dict) -> bytes:
             df.to_excel(writer, index=False, sheet_name=name[:31] or "Sheet")
     return output.getvalue()
 
+# string format helpers (for display tables)
+def fmt_int(x):
+    if x is None or (isinstance(x, float) and np.isnan(x)): return ""
+    return f"{int(round(x)):,}"
+
+def fmt_money(x, decimals=2):
+    if x is None or (isinstance(x, float) and np.isnan(x)): return ""
+    return f"{x:,.{decimals}f}"
+
 # ------------- Main -------------
 if uploaded is None:
     st.info("Upload your Excel to start.")
@@ -236,40 +250,34 @@ with col4:
 # Ensure hours selection
 if not hour_scenarios:
     st.warning("No hours selected; defaulting to 12/16/20/24.")
-    hour_scenarios = [12,16,20,24]
+    hour_scenarios = [12, 16, 20, 24]
 
-# Scenario outputs
+# -------- Scenario outputs (formatted table + charts) --------
 scen_df = scenario_outputs(machines_df, hour_scenarios, days_per_month)
 if "Hours" in scen_df.columns:
     scen_df = scen_df.sort_values("Hours")
 
 st.subheader("🔁 Output by Hours/Day (12h baseline, 28 days/month)")
-st.dataframe(
-    scen_df,
-    use_container_width=True,
-    column_config={
-        "Hours": st.column_config.NumberColumn("Hours/Day", format="%d"),
-        "Daily_Output_cups": st.column_config.NumberColumn("Daily Output (cups)", format="%,.0f"),
-        "Monthly_Output_cups": st.column_config.NumberColumn("Monthly Output (cups)", format="%,.0f"),
-    },
-)
+disp_scen = scen_df.copy()
+disp_scen["Daily Output (cups)"] = disp_scen["Daily_Output_cups"].apply(fmt_int)
+disp_scen["Monthly Output (cups)"] = disp_scen["Monthly_Output_cups"].apply(fmt_int)
+st.table(disp_scen.set_index("Hours")[["Daily Output (cups)", "Monthly Output (cups)"]])
 
-# Charts (comma ticks)
 fig_day = px.bar(
     scen_df, x="Hours", y="Daily_Output_cups",
     title="Daily Output by Hours (cups/day)",
-    text=scen_df["Daily_Output_cups"].round().astype(int).map(lambda x: f"{x:,}")
+    text=scen_df["Daily_Output_cups"].round().astype(int).map(lambda v: f"{v:,}")
 ); fig_day.update_layout(yaxis_tickformat=",")
 st.plotly_chart(fig_day, use_container_width=True)
 
 fig_mon = px.bar(
     scen_df, x="Hours", y="Monthly_Output_cups",
     title=f"Monthly Output by Hours (cups/month) — {days_per_month} days",
-    text=scen_df["Monthly_Output_cups"].round().astype(int).map(lambda x: f"{x:,}")
+    text=scen_df["Monthly_Output_cups"].round().astype(int).map(lambda v: f"{v:,}")
 ); fig_mon.update_layout(yaxis_tickformat=",")
 st.plotly_chart(fig_mon, use_container_width=True)
 
-# 10-year annual forecasts
+# -------- 10-year annual forecasts --------
 sales_enabled = unit_price > 0 and unit_cost >= 0
 tables = annual_forecast(
     machines_df, hour_scenarios, days_per_month, forecast_years,
@@ -280,63 +288,52 @@ st.subheader("📅 10-Year Annual Forecast" + (" — Units, Revenue & GM" if sal
 tab_objs = st.tabs([f"{h}h" for h in hour_scenarios])
 for tab, h in zip(tab_objs, hour_scenarios):
     with tab:
-        cfg = {
-            "Year": st.column_config.NumberColumn("Year", format="%d"),
-            "Hours_per_Day": st.column_config.NumberColumn("Hours/Day", format="%d"),
-            "Output_cups": st.column_config.NumberColumn("Output (cups)", format="%,.0f"),
-        }
-        if sales_enabled:
-            cfg["Revenue"] = st.column_config.NumberColumn("Revenue", format="%,.2f")
-            cfg["Gross_Margin"] = st.column_config.NumberColumn("Gross Margin", format="%,.2f")
-        st.dataframe(tables[h], use_container_width=True, column_config=cfg)
+        disp = tables[h].copy()
+        disp["Output (cups)"] = disp["Output_cups"].apply(fmt_int)
+        cols = ["Year", "Hours_per_Day", "Output (cups)"]
+        if "Revenue" in disp.columns:
+            disp["Revenue"] = disp["Revenue"].apply(lambda x: fmt_money(x, 2))
+            disp["Gross_Margin"] = disp["Gross_Margin"].apply(lambda x: fmt_money(x, 2))
+            cols += ["Revenue", "Gross_Margin"]
+        st.table(disp[cols].set_index("Year"))
 
         fig_line = px.line(tables[h], x="Year", y="Output_cups", markers=True, title=f"Annual Output — {h}h")
         fig_line.update_layout(yaxis_tickformat=",")
         st.plotly_chart(fig_line, use_container_width=True)
 
-# CAPEX replacement plan
+# -------- CAPEX replacement plan --------
 st.subheader("🏭 CAPEX Replacement Schedule (10-year life)")
-capex_df = capex_schedule(machines_df, forecast_years, machine_life_years, capex_each=capex_per_machine if capex_per_machine>0 else 0.0)
-st.dataframe(
-    capex_df,
-    use_container_width=True,
-    column_config={
-        "Year": st.column_config.NumberColumn("Year", format="%d"),
-        "Machines_to_Replace": st.column_config.NumberColumn("Machines to Replace", format="%,d"),
-        **({"CAPEX": st.column_config.NumberColumn("CAPEX", format="%,.0f")} if "CAPEX" in capex_df.columns else {})
-    },
-)
-fig_capex = px.bar(capex_df, x="Year", y="Machines_to_Replace", title="Machines to Replace per Year",
+capex_df = capex_schedule(machines_df, forecast_years, machine_life_years,
+                          capex_each=capex_per_machine if capex_per_machine > 0 else 0.0)
+disp_capex = capex_df.copy()
+if "CAPEX" in disp_capex.columns:
+    disp_capex["CAPEX"] = disp_capex["CAPEX"].apply(lambda x: fmt_money(x, 0))
+st.table(disp_capex.set_index("Year"))
+
+fig_capex = px.bar(capex_df, x="Year", y="Machines_to_Replace",
+                   title="Machines to Replace per Year",
                    text=capex_df["Machines_to_Replace"].astype(int).map(lambda x: f"{x:,}"))
 fig_capex.update_layout(yaxis_tickformat=",")
 st.plotly_chart(fig_capex, use_container_width=True)
 
-# Machine condition table
+# -------- Machine condition --------
 st.subheader("🛠️ Machine Condition & Remaining Life")
 cols = ["Rated_Capacity_cpm","Utilization","Start_Date","Age_years","Remaining_Life_years","End_of_Life_Year"]
+machine_col = machine_col if 'machine_col' in locals() else "Machine"
 show_cols = [c for c in [machine_col, *cols] if c in machines_df.columns]
-st.dataframe(
-    machines_df[show_cols],
-    use_container_width=True,
-    column_config={
-        machine_col: st.column_config.Column(machine_col),
-        "Rated_Capacity_cpm": st.column_config.NumberColumn("Capacity (cups/min)", format="%,.0f"),
-        "Utilization": st.column_config.NumberColumn("Utilization", format="%.2f"),
-        "Age_years": st.column_config.NumberColumn("Age (years)", format="%.2f"),
-        "Remaining_Life_years": st.column_config.NumberColumn("Remaining Life (years)", format="%.2f"),
-        "End_of_Life_Year": st.column_config.NumberColumn("EOL Year", format="%d"),
-    },
-)
+disp_ml = machines_df[show_cols].copy()
+if "Rated_Capacity_cpm" in disp_ml.columns:
+    disp_ml["Rated_Capacity_cpm"] = disp_ml["Rated_Capacity_cpm"].apply(fmt_int)
+for c in ["Age_years","Remaining_Life_years"]:
+    if c in disp_ml.columns:
+        disp_ml[c] = disp_ml[c].apply(lambda x: "" if pd.isna(x) else f"{x:.2f}")
+st.table(disp_ml.set_index(show_cols[0]))
 
-# Downloads
+fig_hist = px.histogram(machines_df, x="Remaining_Life_years", nbins=10, title="Remaining Useful Life (Years)")
+st.plotly_chart(fig_hist, use_container_width=True)
+
+# -------- Downloads --------
 st.subheader("⬇️ Downloads")
-def to_excel_bytes(sheets: dict) -> bytes:
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for name, df in sheets.items():
-            df.to_excel(writer, index=False, sheet_name=name[:31] or "Sheet")
-    return output.getvalue()
-
 report_sheets = {
     "Scenario_Summary": scen_df,
     **{f"Annual_{h}h": tables[h] for h in hour_scenarios},
@@ -344,8 +341,14 @@ report_sheets = {
     "Machine_Life": machines_df[show_cols],
 }
 excel_bytes = to_excel_bytes(report_sheets)
-st.download_button("Download Excel Report (.xlsx)", data=excel_bytes, file_name="Factory_Forecast_Report.xlsx",
+st.download_button("Download Excel Report (.xlsx)", data=excel_bytes,
+                   file_name="Factory_Forecast_Report.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-st.caption("Notes: robust column matching avoids KeyErrors; ages taken from Age/Start Date/Year when available; "
-           "if no hours selected, defaults to 12/16/20/24; numbers show thousands separators.")
+st.download_button("Download Scenario CSV", data=scen_df.to_csv(index=False).encode("utf-8"),
+                   file_name="scenario_summary.csv", mime="text/csv")
+st.download_button("Download CAPEX CSV", data=capex_df.to_csv(index=False).encode("utf-8"),
+                   file_name="capex_schedule.csv", mime="text/csv")
+
+st.caption("Notes: robust column matching; ages from Age/Start Date/Year; "
+           "immediate replacement in EOL year; numbers show thousands separators.")
