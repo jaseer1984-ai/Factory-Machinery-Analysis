@@ -1,4 +1,4 @@
-# app.py — Paper Cup Factory Dashboard (robust ages + comma formatting + hours fallback)
+# app.py — Paper Cup Factory Dashboard (fixed KeyError, robust age detection, comma formatting)
 
 from datetime import datetime
 import io
@@ -29,11 +29,22 @@ with st.sidebar:
     capex_per_machine = st.number_input("CAPEX per machine", min_value=0.0, value=0.0, step=1000.0, format="%.0f")
 
 # ------------- Helpers -------------
-def first_present(cols, options):
-    for o in options:
-        for c in cols:
-            if o == str(c).strip().lower():
-                return c
+
+def find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    """
+    Return the ACTUAL column name from df that matches any name in candidates (case/space tolerant).
+    """
+    norm = {str(c).strip().lower(): c for c in df.columns}
+    for want in candidates:
+        key = str(want).strip().lower()
+        if key in norm:
+            return norm[key]
+    # also try looser contains-match
+    for want in candidates:
+        key = str(want).strip().lower()
+        for k, real in norm.items():
+            if key in k:
+                return real
     return None
 
 def parse_date_series(s: pd.Series):
@@ -64,27 +75,23 @@ def load_workbook(file_bytes: bytes) -> dict:
 
 def detect_key_sheets(sheets: dict):
     names = list(sheets.keys())
-    # Machines
     cand_m = [s for s in names if any(k in s.lower() for k in
              ["machine","assets","equipment","plant","capacity","list","details"])]
     machines_sheet = cand_m[0] if cand_m else names[0]
-    # Production
     cand_p = [s for s in names if any(k in s.lower() for k in
              ["prod","output","shift","daily","util","run","report","sales"]) and s != machines_sheet]
     production_sheet = cand_p[0] if cand_p else (names[1] if len(names)>1 else names[0])
     return machines_sheet, production_sheet
 
 def extract_core(machines_df: pd.DataFrame, prod_df: pd.DataFrame, life_years: float):
-    lm = {c.lower(): c for c in machines_df.columns}
-    lp = {c.lower(): c for c in prod_df.columns}
-
-    machine_col = first_present(lm, ["machine","machine id","machine_name","name","id"]) or "Machine"
+    # Machine identifier
+    machine_col = find_col(machines_df, ["machine","machine id","machine_name","name","id"]) or "Machine"
     if machine_col not in machines_df.columns:
         machines_df["Machine"] = [f"M{i+1}" for i in range(len(machines_df))]
         machine_col = "Machine"
 
     # Capacity
-    cap_col = first_present(lm, [
+    cap_col = find_col(machines_df, [
         "capacity","rated capacity","rated_capacity","cups/min","cups per min",
         "capacity (cups/min)","capacity_cups_min","capacity_cup_min"
     ])
@@ -99,11 +106,11 @@ def extract_core(machines_df: pd.DataFrame, prod_df: pd.DataFrame, life_years: f
         cap_col = "Rated_Capacity_cpm"
 
     # Utilization
-    util_col = first_present(lm, ["utilization","util","uptime %","uptime","availability","runtime%"])
+    util_col = find_col(machines_df, ["utilization","util","uptime %","uptime","availability","runtime%"])
     if util_col is None:
-        util_p = first_present(lp, ["utilization","util","uptime %","uptime","availability","runtime%"])
+        util_p = find_col(prod_df, ["utilization","util","uptime %","uptime","availability","runtime%"])
         if util_p is not None and not prod_df.empty:
-            u = pd.to_numeric(prod_df[util_p].astype(str).replace("%","",regex=True), errors="coerce")/100.0
+            u = pd.to_numeric(prod_df[util_p].astype(str).str.replace("%","",regex=False), errors="coerce")/100.0
             machines_df["Utilization"] = float(u.fillna(u.mean()).clip(0,1).mean())
         else:
             machines_df["Utilization"] = 0.955
@@ -113,32 +120,27 @@ def extract_core(machines_df: pd.DataFrame, prod_df: pd.DataFrame, life_years: f
             u = pd.to_numeric(u.astype(str).str.replace("%","",regex=False), errors="coerce")/100.0
         machines_df["Utilization"] = u.fillna(u.mean()).clip(0,1)
 
-    # ----- Age handling (robust) -----
-    # 1) If we have a direct Age column, use it.
-    age_col = first_present(lm, ["age","age (years)","age_years"])
-    # 2) Otherwise try Start/Commission/Install Date.
-    start_col = first_present(lm, [
+    # ----- Robust Age detection -----
+    today = pd.Timestamp.today().normalize()
+
+    age_col  = find_col(machines_df, ["age","age (years)","age_years"])
+    start_col = find_col(machines_df, [
         "start date","commission date","commission_date","installed on","install date",
         "start_date","commissioning date","commission year","commission_year"
     ])
-    # 3) Otherwise try Year columns (MFG year, installation year, etc.)
-    year_col = first_present(lm, [
+    year_col = find_col(machines_df, [
         "year","mfg year","manufacture year","manufacturing year","year of make",
         "purchase year","installation year","install year","yom","yop"
     ])
 
-    today = pd.Timestamp.today().normalize()
-
-    if age_col is not None:
+    if age_col and age_col in machines_df.columns:
         machines_df["Age_years"] = pd.to_numeric(machines_df[age_col], errors="coerce")
-        # fabricate Start_Date from Age if missing
         machines_df["Start_Date"] = today - pd.to_timedelta((machines_df["Age_years"]*365.25), unit="D")
-    elif start_col is not None:
+    elif start_col and start_col in machines_df.columns:
         machines_df["Start_Date"] = parse_date_series(machines_df[start_col])
         age_days = (today - machines_df["Start_Date"]).dt.days
         machines_df["Age_years"] = (age_days/365.25)
-    elif year_col is not None:
-        # build a Start_Date from January 1st of the given year
+    elif year_col and year_col in machines_df.columns:
         yr = pd.to_numeric(machines_df[year_col], errors="coerce").round().astype("Int64")
         machines_df["Start_Date"] = pd.to_datetime(yr.astype("float").astype("Int64").astype(str) + "-01-01", errors="coerce")
         age_days = (today - machines_df["Start_Date"]).dt.days
@@ -163,9 +165,7 @@ def scenario_outputs(machines_df: pd.DataFrame, hours: list[int], dpm: int):
         cups_day = base_cpm * 60 * h * util
         cups_month = cups_day * dpm
         rows.append({"Hours": h, "Daily_Output_cups": cups_day, "Monthly_Output_cups": cups_month})
-    # Always return columns to avoid KeyErrors on empty selection
-    out = pd.DataFrame(rows, columns=["Hours","Daily_Output_cups","Monthly_Output_cups"])
-    return out
+    return pd.DataFrame(rows, columns=["Hours","Daily_Output_cups","Monthly_Output_cups"])
 
 def annual_forecast(machines_df: pd.DataFrame, hours: list[int], dpm: int, years: int, price=0.0, cost=0.0):
     util = float(machines_df["Utilization"].mean())
@@ -238,7 +238,7 @@ if not hour_scenarios:
     st.warning("No hours selected; defaulting to 12/16/20/24.")
     hour_scenarios = [12,16,20,24]
 
-# Scenario outputs (with comma formatting in UI)
+# Scenario outputs
 scen_df = scenario_outputs(machines_df, hour_scenarios, days_per_month)
 if "Hours" in scen_df.columns:
     scen_df = scen_df.sort_values("Hours")
@@ -254,23 +254,22 @@ st.dataframe(
     },
 )
 
+# Charts (comma ticks)
 fig_day = px.bar(
     scen_df, x="Hours", y="Daily_Output_cups",
     title="Daily Output by Hours (cups/day)",
     text=scen_df["Daily_Output_cups"].round().astype(int).map(lambda x: f"{x:,}")
-)
-fig_day.update_layout(yaxis_tickformat=",")
+); fig_day.update_layout(yaxis_tickformat=",")
 st.plotly_chart(fig_day, use_container_width=True)
 
 fig_mon = px.bar(
     scen_df, x="Hours", y="Monthly_Output_cups",
     title=f"Monthly Output by Hours (cups/month) — {days_per_month} days",
     text=scen_df["Monthly_Output_cups"].round().astype(int).map(lambda x: f"{x:,}")
-)
-fig_mon.update_layout(yaxis_tickformat=",")
+); fig_mon.update_layout(yaxis_tickformat=",")
 st.plotly_chart(fig_mon, use_container_width=True)
 
-# 10-year annual forecasts (comma formatting)
+# 10-year annual forecasts
 sales_enabled = unit_price > 0 and unit_cost >= 0
 tables = annual_forecast(
     machines_df, hour_scenarios, days_per_month, forecast_years,
@@ -295,7 +294,7 @@ for tab, h in zip(tab_objs, hour_scenarios):
         fig_line.update_layout(yaxis_tickformat=",")
         st.plotly_chart(fig_line, use_container_width=True)
 
-# CAPEX replacement plan (comma formatting)
+# CAPEX replacement plan
 st.subheader("🏭 CAPEX Replacement Schedule (10-year life)")
 capex_df = capex_schedule(machines_df, forecast_years, machine_life_years, capex_each=capex_per_machine if capex_per_machine>0 else 0.0)
 st.dataframe(
@@ -312,7 +311,7 @@ fig_capex = px.bar(capex_df, x="Year", y="Machines_to_Replace", title="Machines 
 fig_capex.update_layout(yaxis_tickformat=",")
 st.plotly_chart(fig_capex, use_container_width=True)
 
-# Machine condition table (comma formatting)
+# Machine condition table
 st.subheader("🛠️ Machine Condition & Remaining Life")
 cols = ["Rated_Capacity_cpm","Utilization","Start_Date","Age_years","Remaining_Life_years","End_of_Life_Year"]
 show_cols = [c for c in [machine_col, *cols] if c in machines_df.columns]
@@ -331,6 +330,13 @@ st.dataframe(
 
 # Downloads
 st.subheader("⬇️ Downloads")
+def to_excel_bytes(sheets: dict) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            df.to_excel(writer, index=False, sheet_name=name[:31] or "Sheet")
+    return output.getvalue()
+
 report_sheets = {
     "Scenario_Summary": scen_df,
     **{f"Annual_{h}h": tables[h] for h in hour_scenarios},
@@ -341,5 +347,5 @@ excel_bytes = to_excel_bytes(report_sheets)
 st.download_button("Download Excel Report (.xlsx)", data=excel_bytes, file_name="Factory_Forecast_Report.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-st.caption("Notes: (1) If no dates are provided, age is estimated from Age or Year columns if present. "
-           "(2) Numbers show thousands separators. (3) If no hours are selected, app defaults to 12/16/20/24.")
+st.caption("Notes: robust column matching avoids KeyErrors; ages taken from Age/Start Date/Year when available; "
+           "if no hours selected, defaults to 12/16/20/24; numbers show thousands separators.")
